@@ -11,7 +11,9 @@
 #include "runtime/current_thread.h"
 #include "runtime/primitive_type_infra.h"
 #include "storage/chunk_helper.h"
-#include "storage/primary_key_encoder.h"
+#include "storage/memtable_for_aggregatekey.h"
+#include "storage/memtable_for_dupkey.h"
+#include "storage/memtable_for_primarykey.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/schema.h"
 #include "util/orlp/pdqsort.h"
@@ -20,10 +22,6 @@
 
 namespace starrocks::vectorized {
 
-// TODO(cbl): move to common space latter
-static const string LOAD_OP_COLUMN = "__op";
-static const size_t kPrimaryKeyLimitSize = 128;
-
 MemTable::MemTable(int64_t tablet_id, const TabletSchema* tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
                    RowsetWriter* rowset_writer, MemTracker* mem_tracker)
         : _tablet_id(tablet_id),
@@ -31,24 +29,8 @@ MemTable::MemTable(int64_t tablet_id, const TabletSchema* tablet_schema, const s
           _slot_descs(slot_descs),
           _keys_type(tablet_schema->keys_type()),
           _rowset_writer(rowset_writer),
-          _aggregator(nullptr),
           _mem_tracker(mem_tracker) {
     _vectorized_schema = std::move(ChunkHelper::convert_schema_to_format_v2(*tablet_schema));
-    if (_keys_type == KeysType::PRIMARY_KEYS && _slot_descs->back()->col_name() == LOAD_OP_COLUMN) {
-        // load slots have __op field, so add to _vectorized_schema
-        auto op_column = std::make_shared<starrocks::vectorized::Field>((ColumnId)-1, LOAD_OP_COLUMN,
-                                                                        FieldType::OLAP_FIELD_TYPE_TINYINT, false);
-        op_column->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-        _vectorized_schema.append(op_column);
-        _has_op_slot = true;
-    }
-
-    if (_keys_type != KeysType::DUP_KEYS) {
-        // The ChunkAggregator used by MemTable may be used to aggregate into a large Chunk,
-        // which is not suitable for obtaining Chunk from ColumnPool,
-        // otherwise it will take up a lot of memory and may not be released.
-        _aggregator = std::make_unique<ChunkAggregator>(&_vectorized_schema, 0, INT_MAX, 0);
-    }
 }
 
 MemTable::MemTable(int64_t tablet_id, const Schema& schema, RowsetWriter* rowset_writer, int64_t max_buffer_size,
@@ -59,48 +41,9 @@ MemTable::MemTable(int64_t tablet_id, const Schema& schema, RowsetWriter* rowset
           _slot_descs(nullptr),
           _keys_type(schema.keys_type()),
           _rowset_writer(rowset_writer),
-          _aggregator(nullptr),
           _use_slot_desc(false),
           _max_buffer_size(max_buffer_size),
-          _mem_tracker(mem_tracker) {
-    if (_keys_type != KeysType::DUP_KEYS) {
-        // The ChunkAggregator used by MemTable may be used to aggregate into a large Chunk,
-        // which is not suitable for obtaining Chunk from ColumnPool,
-        // otherwise it will take up a lot of memory and may not be released.
-        _aggregator = std::make_unique<ChunkAggregator>(&_vectorized_schema, 0, INT_MAX, 0);
-    }
-}
-
-MemTable::~MemTable() = default;
-
-size_t MemTable::memory_usage() const {
-    size_t size = 0;
-
-    // used for sort
-    size += sizeof(PermutationItem) * _permutations.size();
-    size += sizeof(uint32_t) * _selective_values.size();
-
-    // _result_chunk is the final result before flush
-    if (_result_chunk != nullptr && _result_chunk->num_rows() > 0) {
-        size += _result_chunk->memory_usage();
-    }
-
-    // _aggregator_memory_usage is 0 if keys type is DUP_KEYS
-    return size + _chunk_memory_usage + _aggregator_memory_usage;
-}
-
-size_t MemTable::write_buffer_size() const {
-    if (_chunk == nullptr) {
-        return 0;
-    }
-
-    // _aggregator_bytes_usage is 0 if keys type is DUP_KEYS
-    return _chunk_bytes_usage + _aggregator_bytes_usage;
-}
-
-bool MemTable::is_full() const {
-    return write_buffer_size() >= _max_buffer_size;
-}
+          _mem_tracker(mem_tracker) {}
 
 bool MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uint32_t from, uint32_t size) {
     if (_chunk == nullptr) {
@@ -132,24 +75,13 @@ bool MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uint32_t from
 
     // if memtable is full, push it to the flush executor,
     // and create a new memtable for incoming data
-    bool suggest_flush = false;
     if (is_full()) {
-        size_t orig_bytes = write_buffer_size();
-        _merge();
-        size_t new_bytes = write_buffer_size();
-        if (new_bytes > orig_bytes * 2 / 3 && _merge_count <= 1) {
-            // this means aggregate doesn't remove enough duplicate rows,
-            // keep inserting into the buffer will cause additional sort&merge,
-            // the cost of extra sort&merge is greater than extra flush IO,
-            // so flush is suggested even buffer is not full
-            suggest_flush = true;
-        }
+        return _insert_full_callback();
     }
-    if (is_full()) {
-        suggest_flush = true;
-    }
+}
 
-    return suggest_flush;
+bool MemTable::_insert_full_callback() {
+    return true;
 }
 
 Status MemTable::finalize() {
@@ -160,55 +92,7 @@ Status MemTable::finalize() {
     int64_t duration_ns = 0;
     {
         SCOPED_RAW_TIMER(&duration_ns);
-
-        if (_keys_type != DUP_KEYS) {
-            if (_chunk->num_rows() > 0) {
-                // merge last undo merge
-                _merge();
-            }
-
-            if (_merge_count > 1) {
-                _chunk = _aggregator->aggregate_result();
-                _aggregator->aggregate_reset();
-
-                int64_t t1 = MonotonicMicros();
-                _sort(true);
-                int64_t t2 = MonotonicMicros();
-                _aggregate(true);
-                int64_t t3 = MonotonicMicros();
-                VLOG(1) << Substitute("memtable final sort:$0 agg:$1 total:$2", t2 - t1, t3 - t2, t3 - t1);
-            } else {
-                // if there is only one data chunk and merge once,
-                // no need to perform an additional merge.
-                _chunk.reset();
-                _result_chunk.reset();
-            }
-            _chunk_memory_usage = 0;
-            _chunk_bytes_usage = 0;
-
-            _result_chunk = _aggregator->aggregate_result();
-            if (_keys_type == PRIMARY_KEYS &&
-                PrimaryKeyEncoder::encode_exceed_limit(_vectorized_schema, *_result_chunk.get(), 0,
-                                                       _result_chunk->num_rows(), kPrimaryKeyLimitSize)) {
-                _aggregator.reset();
-                _aggregator_memory_usage = 0;
-                _aggregator_bytes_usage = 0;
-                return Status::Cancelled("primary key size exceed the limit.");
-            }
-            if (_has_op_slot) {
-                // TODO(cbl): mem_tracker
-                ChunkPtr upserts;
-                RETURN_IF_ERROR(_split_upserts_deletes(_result_chunk, &upserts, &_deletes));
-                if (_result_chunk != upserts) {
-                    _result_chunk = upserts;
-                }
-            }
-            _aggregator.reset();
-            _aggregator_memory_usage = 0;
-            _aggregator_bytes_usage = 0;
-        } else {
-            _sort(true);
-        }
+        RETURN_IF_ERROR(finalize_impl());
     }
 
     StarRocksMetrics::instance()->memtable_flush_duration_us.increment(duration_ns / 1000);
@@ -234,45 +118,31 @@ Status MemTable::flush() {
     return Status::OK();
 }
 
-void MemTable::_merge() {
-    if (_chunk == nullptr || _keys_type == KeysType::DUP_KEYS) {
-        return;
+size_t MemTable::memory_usage() const {
+    size_t size = 0;
+
+    // used for sort
+    size += sizeof(PermutationItem) * _permutations.size();
+    size += sizeof(uint32_t) * _selective_values.size();
+
+    // _result_chunk is the final result before flush
+    if (_result_chunk != nullptr && _result_chunk->num_rows() > 0) {
+        size += _result_chunk->memory_usage();
     }
 
-    int64_t t1 = MonotonicMicros();
-    _sort(false);
-    int64_t t2 = MonotonicMicros();
-    _aggregate(false);
-    int64_t t3 = MonotonicMicros();
-    VLOG(1) << Substitute("memtable sort:$0 agg:$1 total:$2", t2 - t1, t3 - t2, t3 - t1);
-    ++_merge_count;
+    return size + _chunk_memory_usage;
 }
 
-void MemTable::_aggregate(bool is_final) {
-    if (_result_chunk == nullptr || _result_chunk->num_rows() <= 0) {
-        return;
+size_t MemTable::write_buffer_size() const {
+    if (_chunk == nullptr) {
+        return 0;
     }
 
-    DCHECK(_result_chunk->num_rows() < INT_MAX);
-    DCHECK(_aggregator->source_exhausted());
+    return _chunk_bytes_usage;
+}
 
-    _aggregator->update_source(_result_chunk);
-
-    DCHECK(_aggregator->is_do_aggregate());
-
-    _aggregator->aggregate();
-    _aggregator_memory_usage = _aggregator->memory_usage();
-    _aggregator_bytes_usage = _aggregator->bytes_usage();
-
-    // impossible finish
-    DCHECK(!_aggregator->is_finish());
-    DCHECK(_aggregator->source_exhausted());
-
-    if (is_final) {
-        _result_chunk.reset();
-    } else {
-        _result_chunk->reset();
-    }
+bool MemTable::is_full() const {
+    return write_buffer_size() >= _max_buffer_size;
 }
 
 void MemTable::_sort(bool is_final) {
@@ -305,49 +175,6 @@ void MemTable::_append_to_sorted_chunk(Chunk* src, Chunk* dest, bool is_final) {
     }
 }
 
-Status MemTable::_split_upserts_deletes(ChunkPtr& src, ChunkPtr* upserts, std::unique_ptr<Column>* deletes) {
-    size_t op_column_id = src->num_columns() - 1;
-    auto op_column = src->get_column_by_index(op_column_id);
-    src->remove_column_by_index(op_column_id);
-    size_t nrows = src->num_rows();
-    auto* ops = reinterpret_cast<const uint8_t*>(op_column->raw_data());
-    size_t ndel = 0;
-    for (size_t i = 0; i < nrows; i++) {
-        ndel += (ops[i] == TOpType::DELETE);
-    }
-    size_t nupsert = nrows - ndel;
-    if (ndel == 0) {
-        // no deletes, short path
-        *upserts = src;
-        return Status::OK();
-    }
-    vector<uint32_t> indexes[2];
-    indexes[TOpType::UPSERT].reserve(nupsert);
-    indexes[TOpType::DELETE].reserve(ndel);
-    for (uint32_t i = 0; i < nrows; i++) {
-        // ops == 0: upsert  otherwise: delete
-        indexes[ops[i] == TOpType::UPSERT ? TOpType::UPSERT : TOpType::DELETE].push_back(i);
-    }
-    *upserts = src->clone_empty_with_schema(nupsert);
-    (*upserts)->append_selective(*src, indexes[TOpType::UPSERT].data(), 0, nupsert);
-    if (!(*deletes)) {
-        auto st = PrimaryKeyEncoder::create_column(_vectorized_schema, deletes);
-        if (!st.ok()) {
-            LOG(ERROR) << "create column for primary key encoder failed, schema:" << _vectorized_schema
-                       << ", status:" << st.to_string();
-            return st;
-        }
-    }
-    if (*deletes == nullptr) {
-        return Status::RuntimeError("deletes pointer is null");
-    } else {
-        (*deletes)->reset_column();
-    }
-    auto& delidx = indexes[TOpType::DELETE];
-    PrimaryKeyEncoder::encode_selective(_vectorized_schema, *src, delidx.data(), delidx.size(), deletes->get());
-    return Status::OK();
-}
-
 void MemTable::_sort_column_inc() {
     Columns columns;
     std::vector<int> sort_orders;
@@ -361,6 +188,26 @@ void MemTable::_sort_column_inc() {
 
     Status st = stable_sort_and_tie_columns(false, columns, sort_orders, null_firsts, &_permutations);
     CHECK(st.ok());
+}
+
+#define CASE_CREATE_MEMTABLE(CASE_TYPE, MEMTABLE_TYPE)                                                            \
+    case CASE_TYPE: {                                                                                             \
+        return std::make_unique<MEMTABLE_TYPE>(tablet_id, tablet_schema, slot_descs, rowset_writer, mem_tracker); \
+    }
+
+std::unique_ptr<MemTable> MemTable::create_memtable(int64_t tablet_id, const TabletSchema* tablet_schema,
+                                                    const std::vector<SlotDescriptor*>* slot_descs,
+                                                    RowsetWriter* rowset_writer, MemTracker* mem_tracker) {
+    auto keys_type = tablet_schema->keys_type();
+    switch (keys_type) {
+        CASE_CREATE_MEMTABLE(KeysType::DUP_KEYS, MemTableForDupKey)
+        CASE_CREATE_MEMTABLE(KeysType::UNIQUE_KEYS, MemTableForAggregateKey)
+        CASE_CREATE_MEMTABLE(KeysType::AGG_KEYS, MemTableForAggregateKey)
+        CASE_CREATE_MEMTABLE(KeysType::PRIMARY_KEYS, MemTableForPrimaryKey)
+    default:
+        LOG(WARNING) << "memtable not support type: " << keys_type;
+        return nullptr;
+    }
 }
 
 } // namespace starrocks::vectorized

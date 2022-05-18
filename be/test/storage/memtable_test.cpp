@@ -203,7 +203,7 @@ public:
         writer_context.version.first = 10;
         writer_context.version.second = 10;
         ASSERT_TRUE(RowsetFactory::create_rowset_writer(writer_context, &_writer).ok());
-        _mem_table.reset(new MemTable(1, _schema.get(), _slots, _writer.get(), _mem_tracker.get()));
+        _mem_table.reset(MemTable::create_memtable(1, _schema.get(), _slots, _writer.get(), _mem_tracker.get()));
     }
 
     void TearDown() override {
