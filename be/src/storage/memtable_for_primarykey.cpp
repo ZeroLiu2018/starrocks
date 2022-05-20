@@ -28,17 +28,23 @@ MemTableForPrimaryKey::MemTableForPrimaryKey(int64_t tablet_id, const Schema& sc
         : MemTableForAggregateKey(tablet_id, schema, rowset_writer, max_buffer_size, mem_tracker) {}
 
 Status MemTableForPrimaryKey::finalize_impl() {
+    // TODO 这三行感觉统一 defer 处理更好，放在里边太隐秘了
+//    _aggregator.reset();
+//    _aggregator_memory_usage = 0;
+//    _aggregator_bytes_usage = 0;
     RETURN_IF_ERROR(MemTableForAggregateKey::finalize_impl());
     if (PrimaryKeyEncoder::encode_exceed_limit(_vectorized_schema, *_result_chunk.get(), 0, _result_chunk->num_rows(),
                                                kPrimaryKeyLimitSize)) {
         return Status::Cancelled("primary key size exceed the limit.");
     }
 
-    // TODO(cbl): mem_tracker
-    ChunkPtr upserts;
-    RETURN_IF_ERROR(_split_upserts_deletes(_result_chunk, &upserts, &_deletes));
-    if (_result_chunk != upserts) {
-        _result_chunk = upserts;
+    if (_has_op_slot) {
+        // TODO(cbl): mem_tracker
+        ChunkPtr upserts;
+        RETURN_IF_ERROR(_split_upserts_deletes(_result_chunk, &upserts, &_deletes));
+        if (_result_chunk != upserts) {
+            _result_chunk = upserts;
+        }
     }
     return Status::OK();
 }

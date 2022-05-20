@@ -141,6 +141,9 @@ add_library(Storage STATIC
     chunk_aggregator.cpp
     delta_writer.cpp
     memtable.cpp
+    memtable_for_aggregatekey.cpp
+    memtable_for_dupkey.cpp
+    memtable_for_primarykey.cpp
     base_compaction.cpp
     cumulative_compaction.cpp
     compaction.cpp

@@ -78,6 +78,7 @@ bool MemTable::insert(const Chunk& chunk, const uint32_t* indexes, uint32_t from
     if (is_full()) {
         return _insert_full_callback();
     }
+    return false;
 }
 
 bool MemTable::_insert_full_callback() {
@@ -204,6 +205,27 @@ std::unique_ptr<MemTable> MemTable::create_memtable(int64_t tablet_id, const Tab
         CASE_CREATE_MEMTABLE(KeysType::UNIQUE_KEYS, MemTableForAggregateKey)
         CASE_CREATE_MEMTABLE(KeysType::AGG_KEYS, MemTableForAggregateKey)
         CASE_CREATE_MEMTABLE(KeysType::PRIMARY_KEYS, MemTableForPrimaryKey)
+    default:
+        LOG(WARNING) << "memtable not support type: " << keys_type;
+        return nullptr;
+    }
+}
+
+
+#define CASE_CREATE_MEMTABLE1(CASE_TYPE, MEMTABLE_TYPE)                                                            \
+    case CASE_TYPE: {                                                                                             \
+        return std::make_unique<MEMTABLE_TYPE>(tablet_id, schema, rowset_writer, max_buffer_size, mem_tracker); \
+    }
+
+std::unique_ptr<MemTable> MemTable::create_memtable(int64_t tablet_id, const Schema& schema,
+                                                    RowsetWriter* rowset_writer, int64_t max_buffer_size,
+                                                    MemTracker* mem_tracker) {
+    auto keys_type = schema.keys_type();
+    switch (keys_type) {
+        CASE_CREATE_MEMTABLE1(KeysType::DUP_KEYS, MemTableForDupKey)
+        CASE_CREATE_MEMTABLE1(KeysType::UNIQUE_KEYS, MemTableForAggregateKey)
+        CASE_CREATE_MEMTABLE1(KeysType::AGG_KEYS, MemTableForAggregateKey)
+        CASE_CREATE_MEMTABLE1(KeysType::PRIMARY_KEYS, MemTableForPrimaryKey)
     default:
         LOG(WARNING) << "memtable not support type: " << keys_type;
         return nullptr;

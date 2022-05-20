@@ -9,7 +9,7 @@ class MemTableAggregator {
 public:
     MemTableAggregator() = default;
     MemTableAggregator(const Schema* schema)
-            : _aggregator(std::make_unique<ChunkAggregator>(&_vectorized_schema, 0, INT_MAX, 0)) {}
+            : _aggregator(std::make_unique<ChunkAggregator>(schema, 0, INT_MAX, 0)) {}
     ~MemTableAggregator() = default;
     MemTableAggregator(MemTableAggregator&&) = default;
     MemTableAggregator& operator=(MemTableAggregator&&) = default;

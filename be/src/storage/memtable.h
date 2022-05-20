@@ -30,6 +30,9 @@ public:
     static std::unique_ptr<MemTable> create_memtable(int64_t tablet_id, const TabletSchema* tablet_schema,
                                                      const std::vector<SlotDescriptor*>* slot_descs,
                                                      RowsetWriter* rowset_writer, MemTracker* mem_tracker);
+    static std::unique_ptr<MemTable> create_memtable(int64_t tablet_id, const Schema& schema,
+                                                     RowsetWriter* rowset_writer, int64_t max_buffer_size,
+                                                     MemTracker* mem_tracker);
 
     MemTable(int64_t tablet_id, const TabletSchema* tablet_schema, const std::vector<SlotDescriptor*>* slot_descs,
              RowsetWriter* rowset_writer, MemTracker* mem_tracker);
