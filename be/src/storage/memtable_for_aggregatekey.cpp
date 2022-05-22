@@ -39,7 +39,7 @@ void MemTableForAggregateKey::_merge() {
     ++_merge_count;
 }
 
-Status MemTableForAggregateKey::finalize_impl() {
+void MemTableForAggregateKey::final_merge() {
     if (_chunk->num_rows() > 0) {
         // merge last undo merge
         _merge();
@@ -61,6 +61,11 @@ Status MemTableForAggregateKey::finalize_impl() {
         _chunk.reset();
         _result_chunk.reset();
     }
+}
+
+Status MemTableForAggregateKey::finalize_impl() {
+    final_merge();
+
     _chunk_memory_usage = 0;
     _chunk_bytes_usage = 0;
 

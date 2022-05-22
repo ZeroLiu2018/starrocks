@@ -16,6 +16,7 @@
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
 #include "storage/schema.h"
+#include "storage/tablet_schema.h"
 #include "testutil/assert.h"
 #include "util/file_utils.h"
 
@@ -37,7 +38,16 @@ static shared_ptr<TabletSchema> create_tablet_schema(const string& desc, int nke
         if (cid < nkey) {
             cpb->set_aggregation("none");
         } else {
-            cpb->set_aggregation("replace");
+            string agg = "none";
+            if (key_type == KeysType::PRIMARY_KEYS || key_type == KeysType::UNIQUE_KEYS) {
+                agg = "replace";
+            } else if (key_type == KeysType::AGG_KEYS) {
+                if (fs.size() < 3) {
+                    CHECK(false) << "create_tablet_schema bad schema desc";
+                }
+                agg = fs[2];
+            }
+            cpb->set_aggregation(agg);
         }
         cpb->set_unique_id(cid++);
         cpb->set_name(fs[0]);
@@ -264,6 +274,55 @@ TEST_F(MemTableTest, testDupKeysInsertFlushRead) {
     ASSERT_EQ(n, pkey_read);
 }
 
+TEST_F(MemTableTest, testDupKeysDupInserFlushRead) {
+    const string path = "./ut_dir/MemTableTest_testDupKeysDupInserFlushRead";
+    MySetUp("pk int,name varchar,pv int", "pk int,name varchar,pv int", 1, KeysType::DUP_KEYS, path);
+    const size_t n = 3000;
+    auto pchunk = gen_chunk(*_slots, n);
+    vector<uint32_t> indexes;
+    indexes.reserve(n);
+    for (int i = 0; i < n; i++) {
+        indexes.emplace_back(i);
+    }
+    // double insert
+    for (int i = 0; i < n; i++) {
+        indexes.emplace_back(i);
+    }
+    std::random_shuffle(indexes.begin(), indexes.end());
+    _mem_table->insert(*pchunk, indexes.data(), 0, indexes.size());
+    ASSERT_TRUE(_mem_table->finalize().ok());
+    ASSERT_OK(_mem_table->flush());
+    RowsetSharedPtr rowset = *_writer->build();
+    unique_ptr<Schema> read_schema = create_schema("pk int", 1);
+    OlapReaderStatistics stats;
+    vectorized::RowsetReadOptions rs_opts;
+    rs_opts.sorted = false;
+    rs_opts.use_page_cache = false;
+    rs_opts.stats = &stats;
+    auto itr = rowset->new_iterator(*read_schema, rs_opts);
+    ASSERT_TRUE(itr.ok()) << itr.status().to_string();
+    std::shared_ptr<vectorized::Chunk> chunk = vectorized::ChunkHelper::new_chunk(*read_schema, 4096);
+    size_t pkey_read = 0;
+    while (true) {
+        Status st = (*itr)->get_next(chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        auto column = chunk->get_column_by_name("pk");
+        int last_value = 0;
+        for (size_t i = 0; i < column->size(); i += 2) {
+            int new_value1 = column->get(i).get_int32();
+            int new_value2 = column->get(i + 1).get_int32();
+            ASSERT_EQ(new_value1, new_value2);
+            ASSERT_LE(last_value, new_value1);
+            last_value = new_value1;
+        }
+        pkey_read += chunk->num_rows();
+        chunk->reset();
+    }
+    ASSERT_EQ(2 * n, pkey_read);
+}
+
 TEST_F(MemTableTest, testUniqKeysInsertFlushRead) {
     const string path = "./ut_dir/MemTableTest_testUniqKeysInsertFlushRead";
     MySetUp("pk int,name varchar,pv int", "pk int,name varchar,pv int", 1, KeysType::UNIQUE_KEYS, path);
@@ -308,6 +367,51 @@ TEST_F(MemTableTest, testUniqKeysInsertFlushRead) {
         chunk->reset();
     }
     ASSERT_EQ(n, pkey_read);
+}
+
+TEST_F(MemTableTest, testAggregateInsertFlushRead) {
+    const string path = "./ut_dir/MemTableTest_testAggregateInsertFlushRead";
+    MySetUp("pk int,pv int SUM", "pk int,pv int SUM", 1, KeysType::AGG_KEYS, path);
+    const size_t n = 100;
+    // [3, 102]
+    auto pchunk = gen_chunk(*_slots, n);
+    vector<uint32_t> indexes;
+    indexes.reserve(n);
+    for (int i = 0; i < n; i++) {
+        indexes.emplace_back(i);
+    }
+    // agg
+    for (int i = 0; i < n; i++) {
+        indexes.emplace_back(i);
+    }
+    _mem_table->insert(*pchunk, indexes.data(), 0, indexes.size());
+    ASSERT_TRUE(_mem_table->finalize().ok());
+    ASSERT_OK(_mem_table->flush());
+    RowsetSharedPtr rowset = *_writer->build();
+    unique_ptr<Schema> read_schema = create_schema("pv int", 1);
+    OlapReaderStatistics stats;
+    vectorized::RowsetReadOptions rs_opts;
+    rs_opts.sorted = false;
+    rs_opts.use_page_cache = false;
+    rs_opts.stats = &stats;
+    auto itr = rowset->new_iterator(*read_schema, rs_opts);
+    ASSERT_TRUE(itr.ok()) << itr.status().to_string();
+    std::shared_ptr<vectorized::Chunk> chunk = vectorized::ChunkHelper::new_chunk(*read_schema, 4096);
+    size_t pv_read = 0;
+    while (true) {
+        Status st = (*itr)->get_next(chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        auto column = chunk->get_column_by_name("pv");
+        for (size_t i = 0; i < column->size(); i++) {
+            int v = column->get(i).get_int32();
+            ASSERT_EQ(v, 2 * (i + 3));
+        }
+        chunk->reset();
+        pv_read += chunk->num_rows();
+    }
+    ASSERT_EQ(n, pv_read);
 }
 
 TEST_F(MemTableTest, testPrimaryKeysWithDeletes) {

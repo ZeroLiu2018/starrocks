@@ -8,8 +8,7 @@ namespace vectorized {
 class MemTableAggregator {
 public:
     MemTableAggregator() = default;
-    MemTableAggregator(const Schema* schema)
-            : _aggregator(std::make_unique<ChunkAggregator>(schema, 0, INT_MAX, 0)) {}
+    MemTableAggregator(const Schema* schema) : _aggregator(std::make_unique<ChunkAggregator>(schema, 0, INT_MAX, 0)) {}
     ~MemTableAggregator() = default;
     MemTableAggregator(MemTableAggregator&&) = default;
     MemTableAggregator& operator=(MemTableAggregator&&) = default;
@@ -50,12 +49,14 @@ protected:
     Status finalize_impl() override;
     bool _insert_full_callback() override;
 
+    void final_merge();
+    // aggregate
+    MemTableAggregator _aggregator;
+
 private:
     void _merge();
 
     uint64_t _merge_count = 0;
-    // aggregate
-    MemTableAggregator _aggregator;
 };
 
 } // namespace vectorized
